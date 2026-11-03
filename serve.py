@@ -23,4 +23,16 @@ mcp.settings.transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=False
 )
 
+
+# Public, harmless endpoint for wake-up pings and health checks.
+# It returns "ok" and exposes no tools, so it doesn't reveal the secret path.
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> PlainTextResponse:
+    return PlainTextResponse("ok")
+
+
 mcp.run(transport="streamable-http")
