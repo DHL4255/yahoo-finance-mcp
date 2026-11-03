@@ -1,0 +1,18 @@
+# Remote (HTTP) build of yahoo-finance-mcp for cloud hosts such as Render.
+# Needs one environment variable: MCP_PATH (the secret URL path).
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY yahoo_finance_mcp.py serve.py ./
+
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
+CMD ["python", "serve.py"]
