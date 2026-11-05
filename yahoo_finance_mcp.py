@@ -330,6 +330,213 @@ def truncate_json_response(payload: str, message: str = "") -> str:
 # ============================================================================
 
 
+# ----------------------------------------------------------------------------
+# get_stock_quote fallback for when Yahoo blocks quoteSummary
+# ----------------------------------------------------------------------------
+#
+# Some cloud hosts (Render among them) get HTTP 429 on Yahoo's cookie/crumb
+# handshake. quoteSummary then answers 401 "Invalid Crumb" and Ticker.info
+# comes back with about one key. The chart, fundamentals-timeseries and search
+# endpoints need no crumb, so get_stock_quote rebuilds its fields from those.
+
+# Imported here rather than at the top: only the helpers below use them.
+import math  # noqa: E402
+import time  # noqa: E402
+
+_INFO_MIN_KEYS = 10  # an .info with fewer keys than this was blocked
+_INFO_BACKOFF_SECONDS = 30 * 60  # skip .info this long after a blocked call
+_FALLBACK_TTL_SECONDS = 6 * 60 * 60  # how long computed values are reused
+_BETA_MIN_MONTHS = 24  # fewest monthly returns a beta is computed from
+_BETA_BENCHMARK = "^GSPC"
+
+_info_blocked_until = 0.0  # time.monotonic() before which .info is skipped
+_fallback_cache: Dict[Any, Any] = {}  # (symbol, kind) -> (stored_at, value)
+
+
+def _quote_info(ticker_obj: Any) -> Dict[str, Any]:
+    """Ticker.info, or {} while quoteSummary is blocked.
+
+    A failed or near-empty .info starts a 30-minute back-off, so each quote
+    doesn't spend its time retrying a handshake that will be refused again.
+    """
+    global _info_blocked_until
+    if time.monotonic() < _info_blocked_until:
+        return {}
+    try:
+        info = ticker_obj.info or {}
+    except Exception:
+        info = {}
+    if len(info) < _INFO_MIN_KEYS:
+        _info_blocked_until = time.monotonic() + _INFO_BACKOFF_SECONDS
+        return {}
+    return info
+
+
+def _cached(symbol: str, kind: str, compute: Any, *args: Any) -> Any:
+    """compute(*args) for (symbol, kind), reused for 6 hours.
+
+    A failure (an exception or None) is not cached, so the next call retries.
+    """
+    key = (symbol, kind)
+    hit = _fallback_cache.get(key)
+    if hit is not None and time.monotonic() - hit[0] < _FALLBACK_TTL_SECONDS:
+        return hit[1]
+    try:
+        value = compute(*args)
+    except Exception:
+        return None
+    if value is not None:
+        _fallback_cache[key] = (time.monotonic(), value)
+    return value
+
+
+def _finite(value: Any) -> Any:
+    """value as a finite float, or None if missing, "N/A", NaN or non-numeric."""
+    if value is None or isinstance(value, (bool, str)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _is_missing(value: Any) -> bool:
+    """True for a quote field Yahoo left out: None, "N/A", "" or NaN."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() in ("", "N/A")
+    return isinstance(value, float) and math.isnan(value)
+
+
+def _fast_value(fast_info: Any, key: str) -> Any:
+    """One fast_info field as a finite float, or None.
+
+    fast_info loads each key lazily from the chart endpoint, so one key can
+    fail (or come back NaN) while the others are fine.
+    """
+    if fast_info is None:
+        return None
+    try:
+        return _finite(fast_info[key])
+    except Exception:
+        return None
+
+
+def _year_extreme(fast_info: Any, year_key: str, day_key: str, pick: Any) -> Any:
+    """fast_info's 52-week low/high, widened to include today's range.
+
+    yearLow/yearHigh come from daily bars that can stop at yesterday, which
+    would show a 52-week high below today's high.
+    """
+    year = _fast_value(fast_info, year_key)
+    if year is None:
+        return None
+    day = _fast_value(fast_info, day_key)
+    return year if day is None else pick(year, day)
+
+
+def _as_int(value: Any) -> Any:
+    """A whole number (volume, market cap) so the thousands formatting works."""
+    return None if value is None else int(round(value))
+
+
+def _ttm_eps(ticker_obj: Any) -> Any:
+    """Latest trailing-twelve-month EPS: diluted, else basic."""
+    stmt = ticker_obj.get_income_stmt(freq="trailing")
+    if stmt is None or getattr(stmt, "empty", True):
+        return None
+    for period in sorted(stmt.columns, reverse=True):
+        for row in ("DilutedEPS", "BasicEPS"):
+            if row in stmt.index:
+                eps = _finite(stmt.at[row, period])
+                if eps is not None:
+                    return eps
+    return None
+
+
+def _monthly_closes(ticker_obj: Any) -> Any:
+    """Five years of monthly closes, keyed by calendar month."""
+    hist = ticker_obj.history(period="5y", interval="1mo")
+    if hist is None or hist.empty or "Close" not in hist:
+        return None
+    closes = hist["Close"].dropna()
+    index = closes.index
+    if getattr(index, "tz", None) is not None:
+        index = index.tz_localize(None)
+    closes.index = index.to_period("M")
+    # Yahoo can send the current month twice: the month bar plus a separate
+    # partial bar for the latest session. Keep one row per month.
+    closes = closes[~closes.index.duplicated(keep="last")]
+    return closes if len(closes) > _BETA_MIN_MONTHS else None
+
+
+def _beta(ticker_obj: Any) -> Any:
+    """5-year monthly beta against the S&P 500: cov(stock, index) / var(index)."""
+    stock = _monthly_closes(ticker_obj)
+    market = _cached(
+        _BETA_BENCHMARK,
+        "monthly_closes",
+        lambda: _monthly_closes(make_ticker(_BETA_BENCHMARK)),
+    )
+    if stock is None or market is None:
+        return None
+    both = pd.concat([stock, market], axis=1, join="inner").dropna()
+    returns = both.pct_change().dropna()
+    if len(returns) < _BETA_MIN_MONTHS:
+        return None
+    variance = _finite(returns.iloc[:, 1].var())
+    if not variance:
+        return None
+    beta = _finite(returns.iloc[:, 0].cov(returns.iloc[:, 1]) / variance)
+    return None if beta is None else round(beta, 3)
+
+
+def _ttm_dividends(ticker_obj: Any) -> Any:
+    """Dividends per share with an ex-date in the last 365 days (0.0 if none)."""
+    hist = ticker_obj.history(period="2y", interval="1d", actions=True)
+    if hist is None or hist.empty:
+        return None  # no prices at all: the fetch failed, not "no dividends"
+    if "Dividends" not in hist:
+        return 0.0
+    dividends = hist["Dividends"]
+    cutoff = pd.Timestamp.now(tz=dividends.index.tz) - pd.Timedelta(days=365)
+    recent = dividends[(dividends.index >= cutoff) & (dividends > 0)]
+    return float(recent.sum())
+
+
+def _search_profile(ticker: str) -> Any:
+    """longName, sector and industry from Yahoo search, for this exact symbol."""
+    session = _get_session()
+    extra = {"session": session} if session is not None else {}
+    search = yf.Search(
+        ticker, max_results=10, news_count=0, lists_count=0, include_cb=False, **extra
+    )
+    for quote in search.quotes or []:
+        if str(quote.get("symbol", "")).upper() != ticker:
+            continue
+        profile = {
+            "longName": quote.get("longname") or quote.get("shortname"),
+            "sector": quote.get("sectorDisp") or quote.get("sector"),
+            "industry": quote.get("industryDisp") or quote.get("industry"),
+        }
+        profile = {k: v for k, v in profile.items() if v}
+        # Search writes "Software—Infrastructure"; quoteSummary writes
+        # "Software - Infrastructure". Match quoteSummary.
+        for key in ("sector", "industry"):
+            if key in profile:
+                profile[key] = profile[key].replace("—", " - ")
+        return profile or None
+    return None
+
+
+def _history_name(ticker_obj: Any) -> Any:
+    """longName from the chart endpoint's metadata."""
+    meta = ticker_obj.get_history_metadata() or {}
+    return meta.get("longName") or meta.get("shortName")
+
+
 @mcp.tool(
     name="get_stock_quote",
     annotations={
@@ -365,18 +572,112 @@ async def get_stock_quote(
     ticker = _norm_ticker(ticker)
     try:
         ticker_obj = make_ticker(ticker)
-        info = ticker_obj.info
+        info = _quote_info(ticker_obj)  # {} while quoteSummary is blocked
+        computed: List[str] = []  # fields filled without quoteSummary
+
+        def field(key: str, label: str, compute: Any) -> Any:
+            """info[key] if quoteSummary has it, else compute(), else "N/A"."""
+            value = info.get(key)
+            if not _is_missing(value):
+                return value
+            try:
+                value = compute()
+            except Exception:
+                value = None
+            if _is_missing(value):
+                return "N/A"
+            if label not in computed:
+                computed.append(label)
+            return value
 
         # Get fast info for real-time data
         try:
             fast_info = ticker_obj.fast_info
-            current_price = fast_info.get("lastPrice", safe_get(info, "currentPrice"))
-            previous_close = fast_info.get(
-                "previousClose", safe_get(info, "previousClose")
-            )
         except Exception:
-            current_price = safe_get(info, "currentPrice")
-            previous_close = safe_get(info, "previousClose")
+            fast_info = None
+        current_price = _fast_value(fast_info, "lastPrice")
+        if current_price is None:
+            current_price = _finite(info.get("currentPrice"))
+        previous_close = _fast_value(fast_info, "previousClose")
+        if previous_close is None:
+            previous_close = _finite(info.get("previousClose"))
+        current_price = "N/A" if current_price is None else current_price
+        previous_close = "N/A" if previous_close is None else previous_close
+        price = _finite(current_price)
+
+        open_price = field("open", "open", lambda: _fast_value(fast_info, "open"))
+        day_low = field(
+            "dayLow", "day range", lambda: _fast_value(fast_info, "dayLow")
+        )
+        day_high = field(
+            "dayHigh", "day range", lambda: _fast_value(fast_info, "dayHigh")
+        )
+        year_low = field(
+            "fiftyTwoWeekLow",
+            "52-week range",
+            lambda: _year_extreme(fast_info, "yearLow", "dayLow", min),
+        )
+        year_high = field(
+            "fiftyTwoWeekHigh",
+            "52-week range",
+            lambda: _year_extreme(fast_info, "yearHigh", "dayHigh", max),
+        )
+        volume = field(
+            "volume",
+            "volume",
+            lambda: _as_int(_fast_value(fast_info, "lastVolume")),
+        )
+        avg_volume = field(
+            "averageVolume",
+            "avg volume",
+            lambda: _as_int(_fast_value(fast_info, "threeMonthAverageVolume")),
+        )
+        market_cap = field(
+            "marketCap",
+            "market cap",
+            lambda: _as_int(_fast_value(fast_info, "marketCap")),
+        )
+        eps = field(
+            "trailingEps",
+            "EPS",
+            lambda: _cached(ticker, "eps", _ttm_eps, ticker_obj),
+        )
+        eps_value = _finite(eps)
+        pe_ratio = field(
+            "trailingPE",
+            "P/E",
+            lambda: (
+                round(price / eps_value, 2)
+                if price is not None and eps_value is not None and eps_value > 0
+                else None
+            ),
+        )
+        beta = field(
+            "beta", "beta", lambda: _cached(ticker, "beta", _beta, ticker_obj)
+        )
+
+        def computed_dividend_yield() -> Any:
+            ttm = _cached(ticker, "ttm_dividends", _ttm_dividends, ticker_obj)
+            if ttm is None or not price:
+                return None
+            # Percent, like quoteSummary's dividendYield (0.0 for a non-payer).
+            return round(ttm / price * 100, 2)
+
+        dividend_yield = field(
+            "dividendYield", "dividend yield", computed_dividend_yield
+        )
+
+        profile: Dict[str, Any] = {}
+        if any(_is_missing(info.get(k)) for k in ("longName", "sector", "industry")):
+            profile = _cached(ticker, "profile", _search_profile, ticker) or {}
+        long_name = field(
+            "longName",
+            "name",
+            lambda: profile.get("longName") or _history_name(ticker_obj),
+        )
+        sector = field("sector", "sector", lambda: profile.get("sector"))
+        industry = field("industry", "industry", lambda: profile.get("industry"))
+        website = safe_get(info, "website")  # no crumb-free source
 
         # Calculate change
         if current_price != "N/A" and previous_close != "N/A":
@@ -391,7 +692,8 @@ async def get_stock_quote(
             change_pct = "N/A"
 
         if response_format == ResponseFormat.MARKDOWN:
-            result = f"# {safe_get(info, 'longName', ticker)} ({ticker})\n\n"
+            title = ticker if long_name == "N/A" else long_name
+            result = f"# {title} ({ticker})\n\n"
             result += f"**Current Price:** {format_currency(current_price)}\n"
 
             if change != "N/A":
@@ -400,29 +702,36 @@ async def get_stock_quote(
 
             result += "\n## Market Data\n"
             result += f"- **Previous Close:** {format_currency(previous_close)}\n"
-            result += f"- **Open:** {format_currency(safe_get(info, 'open'))}\n"
-            result += f"- **Day's Range:** {format_currency(safe_get(info, 'dayLow'))} - {format_currency(safe_get(info, 'dayHigh'))}\n"
-            result += f"- **52 Week Range:** {format_currency(safe_get(info, 'fiftyTwoWeekLow'))} - {format_currency(safe_get(info, 'fiftyTwoWeekHigh'))}\n"
+            result += f"- **Open:** {format_currency(open_price)}\n"
+            result += f"- **Day's Range:** {format_currency(day_low)} - {format_currency(day_high)}\n"
+            result += f"- **52 Week Range:** {format_currency(year_low)} - {format_currency(year_high)}\n"
             result += (
-                f"- **Volume:** {safe_get(info, 'volume'):,}\n"
-                if safe_get(info, "volume") != "N/A"
+                f"- **Volume:** {volume:,}\n"
+                if volume != "N/A"
                 else "- **Volume:** N/A\n"
             )
             result += (
-                f"- **Avg Volume:** {safe_get(info, 'averageVolume'):,}\n"
-                if safe_get(info, "averageVolume") != "N/A"
+                f"- **Avg Volume:** {avg_volume:,}\n"
+                if avg_volume != "N/A"
                 else "- **Avg Volume:** N/A\n"
             )
-            result += f"- **Market Cap:** {format_large_number(safe_get(info, 'marketCap'))}\n"
-            result += f"- **Beta:** {safe_get(info, 'beta')}\n"
-            result += f"- **PE Ratio:** {safe_get(info, 'trailingPE')}\n"
-            result += f"- **EPS:** {format_currency(safe_get(info, 'trailingEps'))}\n"
-            result += f"- **Dividend Yield:** {format_dividend_yield(safe_get(info, 'dividendYield'))}\n"
+            result += f"- **Market Cap:** {format_large_number(market_cap)}\n"
+            result += f"- **Beta:** {beta}\n"
+            result += f"- **PE Ratio:** {pe_ratio}\n"
+            result += f"- **EPS:** {format_currency(eps)}\n"
+            result += f"- **Dividend Yield:** {format_dividend_yield(dividend_yield)}\n"
 
             result += "\n## Company Info\n"
-            result += f"- **Sector:** {safe_get(info, 'sector')}\n"
-            result += f"- **Industry:** {safe_get(info, 'industry')}\n"
-            result += f"- **Website:** {safe_get(info, 'website')}\n"
+            result += f"- **Sector:** {sector}\n"
+            result += f"- **Industry:** {industry}\n"
+            result += f"- **Website:** {website}\n"
+
+            if computed:
+                reason = "missing from quoteSummary" if info else "quoteSummary unavailable"
+                result += (
+                    f"\n*Computed from crumb-free Yahoo data ({reason}): "
+                    f"{', '.join(computed)}.*\n"
+                )
 
             return truncate_response(
                 result, "Use get_company_info for more detailed information."
@@ -430,26 +739,27 @@ async def get_stock_quote(
         else:
             result = {
                 "ticker": ticker,
-                "longName": safe_get(info, "longName"),
+                "longName": long_name,
                 "currentPrice": current_price,
                 "previousClose": previous_close,
                 "change": change,
                 "changePercent": change_pct,
-                "open": safe_get(info, "open"),
-                "dayLow": safe_get(info, "dayLow"),
-                "dayHigh": safe_get(info, "dayHigh"),
-                "fiftyTwoWeekLow": safe_get(info, "fiftyTwoWeekLow"),
-                "fiftyTwoWeekHigh": safe_get(info, "fiftyTwoWeekHigh"),
-                "volume": safe_get(info, "volume"),
-                "averageVolume": safe_get(info, "averageVolume"),
-                "marketCap": safe_get(info, "marketCap"),
-                "beta": safe_get(info, "beta"),
-                "trailingPE": safe_get(info, "trailingPE"),
-                "trailingEps": safe_get(info, "trailingEps"),
-                "dividendYield": safe_get(info, "dividendYield"),
-                "sector": safe_get(info, "sector"),
-                "industry": safe_get(info, "industry"),
-                "website": safe_get(info, "website"),
+                "open": open_price,
+                "dayLow": day_low,
+                "dayHigh": day_high,
+                "fiftyTwoWeekLow": year_low,
+                "fiftyTwoWeekHigh": year_high,
+                "volume": volume,
+                "averageVolume": avg_volume,
+                "marketCap": market_cap,
+                "beta": beta,
+                "trailingPE": pe_ratio,
+                "trailingEps": eps,
+                "dividendYield": dividend_yield,
+                "sector": sector,
+                "industry": industry,
+                "website": website,
+                "dataSource": "yahoo quoteSummary" if info else "computed fallback",
             }
             return json.dumps(result, indent=2)
 
