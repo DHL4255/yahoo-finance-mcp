@@ -598,7 +598,9 @@ async def get_stock_quote(
         current_price = _fast_value(fast_info, "lastPrice")
         if current_price is None:
             current_price = _finite(info.get("currentPrice"))
-        previous_close = _fast_value(fast_info, "previousClose")
+        # Not fast_info["previousClose"]: that is the previous day's last
+        # hourly bar including after-hours, not the official close.
+        previous_close = _fast_value(fast_info, "regularMarketPreviousClose")
         if previous_close is None:
             previous_close = _finite(info.get("previousClose"))
         current_price = "N/A" if current_price is None else current_price
