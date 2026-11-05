@@ -10,6 +10,20 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 import yahoo_finance_mcp as yfm
 
+import logging, sys
+import yfinance as yf
+
+if os.environ.get("YF_DEBUG"):
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    logging.getLogger("yfinance").setLevel(logging.DEBUG)
+    print("yfinance version:", yf.__version__, flush=True)
+    print("session type:", type(yfm._get_session()).__name__, flush=True)
+    try:
+        info = yfm.make_ticker("AAPL").info
+        print("info keys:", len(info), "longName:", info.get("longName"), flush=True)
+    except Exception as e:
+        print("DEBUG info error:", repr(e), flush=True)
+
 mcp = yfm.mcp
 mcp.settings.host = "0.0.0.0"
 mcp.settings.port = int(os.environ.get("PORT", "8000"))
